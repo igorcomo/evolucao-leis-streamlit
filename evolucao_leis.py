@@ -4,176 +4,126 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ----------------------------------------------------------
-# CONFIGURAÇÃO INICIAL
-# ----------------------------------------------------------
-st.set_page_config(
-    page_title="Evolução dos Projetos de Lei – Câmara dos Deputados",
-    layout="wide"
-)
+BASE = "https://dadosabertos.camara.leg.br/api/v2"
 
-st.title("📊 Evolução de Projetos de Lei (PL) – Câmara dos Deputados")
-st.caption("Fonte dos dados: API de Dados Abertos da **Câmara dos Deputados**. (Correção do professor)")
+@st.cache_data(show_spinner=False, ttl=60*30)
+def fetch_proposicoes(ano_ini: int, ano_fim: int, tipo="PL"):
+    """Busca TODAS as proposições do período, com paginação (100 por página)."""
+    itens = 100
+    pagina = 1
+    rows = []
 
-
-# ==========================================================
-# FUNÇÃO OTIMIZADA PARA BUSCAR PROPOSIÇÕES
-# – Sem paginação (muito mais rápido)
-# – Apenas 1 requisição por ano
-# – Cache de 24h
-# ==========================================================
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def fetch_proposicoes(tipo="PL", ano_ini=2019, ano_fim=2025):
-    url = "https://dadosabertos.camara.leg.br/api/v2/proposicoes"
-    dados = []
-
-    for ano in range(ano_ini, ano_fim + 1):
+    while True:
         params = {
-            "siglaTipo": tipo,
-            "ano": ano,
-            "itens": 1000,      # Tenta puxar o máximo possível de uma vez
+            "tipo": tipo,
+            "dataApresentacaoIni": f"{ano_ini}-01-01",
+            "dataApresentacaoFim": f"{ano_fim}-12-31",
             "ordem": "ASC",
-            "ordenarPor": "id"
+            "ordenarPor": "id",
+            "itens": itens,
+            "pagina": pagina,
         }
+        r = requests.get(f"{BASE}/proposicoes", params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("dados", [])
+        if not data:
+            break
+        rows.extend(data)
+        pagina += 1
+        time.sleep(0.2)  # respeitar limites
 
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            lista = r.json().get("dados", [])
-
-            for d in lista:
-                dados.append({
-                    "id": d.get("id"),
-                    "ano": ano,
-                    "numero": d.get("numero"),
-                    "siglaTipo": d.get("siglaTipo"),
-                    "ementa": d.get("ementa"),
-                    "dataApresentacao": d.get("dataApresentacao"),
-                    "uriAutores": d.get("uriAutores")
-                })
-
-        except Exception:
-            pass
-
-        time.sleep(0.2)
-
-    df = pd.DataFrame(dados)
-
-    if not df.empty:
+    df = pd.DataFrame(rows)
+    # Garantir coluna dataApresentacao no formato data
+    if "dataApresentacao" in df.columns:
         df["dataApresentacao"] = pd.to_datetime(df["dataApresentacao"], errors="coerce")
-        df["mes"] = df["dataApresentacao"].dt.to_period("M").astype(str)
-
+        df["ano_mes"] = df["dataApresentacao"].dt.to_period("M").astype(str)
+        df["ano"] = df["dataApresentacao"].dt.year
     return df
 
-
-# ==========================================================
-# BUSCA DE PARTIDOS (AUTORIA)
-# – Agora usa amostragem e não consulta todos os PLs
-# – Muito mais rápido e leve
-# ==========================================================
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def buscar_partidos(ids):
-    registros = []
+@st.cache_data(show_spinner=False, ttl=60*30)
+def fetch_partidos_por_proposicoes(ids):
+    """Para cada proposição, busca autores e retorna contagem de siglaPartido."""
+    cont = {}
     for pid in ids:
         try:
-            url = f"https://dadosabertos.camara.leg.br/api/v2/proposicoes/{pid}/autores"
-            r = requests.get(url, timeout=15)
+            r = requests.get(f"{BASE}/proposicoes/{pid}/autores", timeout=30)
             r.raise_for_status()
-
             autores = r.json().get("dados", [])
-            for a in autores[:3]:  # limita a 3 autores por PL
-                partido = (
-                    (a.get("autor") or {}).get("siglaPartido")
-                    or a.get("siglaPartidoAutor")
-                    or "SEM_PARTIDO"
-                )
-                registros.append({"id": pid, "partido": partido})
-
+            for a in autores:
+                # Considerar apenas parlamentares
+                if a.get("tipoAutor") == "Parlamentar":
+                    sigla = a.get("siglaPartidoAutor") or a.get("siglaPartido") or "SEM_PARTIDO"
+                    sigla = (sigla or "").strip() or "SEM_PARTIDO"
+                    cont[sigla] = cont.get(sigla, 0) + 1
+            time.sleep(0.15)
         except Exception:
-            registros.append({"id": pid, "partido": "SEM_PARTIDO"})
+            # em caso de erro pontual nessa proposição, segue
+            continue
+    dfp = pd.DataFrame([{"partido": k, "qtd": v} for k, v in cont.items()])
+    if not dfp.empty:
+        dfp = dfp.sort_values("qtd", ascending=False).reset_index(drop=True)
+    return dfp
 
-        time.sleep(0.05)
+def grafico_evolucao(df):
+    """Gráfico 1: Evolução mensal (ano-mês) de apresentação de PLs."""
+    if df.empty:
+        st.info("Sem dados para o período.")
+        return
+    serie = df.groupby("ano_mes")["id"].count()
+    fig, ax = plt.subplots()
+    ax.plot(serie.index, serie.values, marker="o")
+    ax.set_title("Evolução Mensal de PLs (Apresentação)")
+    ax.set_xlabel("Ano-Mês")
+    ax.set_ylabel("Quantidade de PLs")
+    plt.xticks(rotation=45, ha="right")
+    st.pyplot(fig)
 
-    return pd.DataFrame(registros)
+def grafico_por_partido(df):
+    """Gráfico 2: Distribuição por partido (autores)."""
+    if df.empty:
+        st.info("Sem dados para o período.")
+        return
+    ids = df["id"].tolist()
+    # Para performance, limitar a, por exemplo, 1500 proposições (ajuste se quiser)
+    ids = ids[:1500]
+    dfp = fetch_partidos_por_proposicoes(ids)
+    if dfp.empty:
+        st.info("Não foi possível recuperar partidos dos autores.")
+        return
 
+    top = st.slider("Quantos partidos exibir (TOP N)?", 5, min(20, len(dfp)), 10)
+    dfp_top = dfp.head(top)
 
-# ----------------------------------------------------------
-# INTERFACE – PARÂMETROS DO USUÁRIO
-# ----------------------------------------------------------
-col1, col2, col3 = st.columns(3)
+    fig, ax = plt.subplots()
+    ax.bar(dfp_top["partido"], dfp_top["qtd"])
+    ax.set_title("Proposições por Partido (Autores)")
+    ax.set_xlabel("Partido")
+    ax.set_ylabel("Quantidade")
+    plt.xticks(rotation=45, ha="right")
+    st.pyplot(fig)
 
+# ------------------ UI ------------------
+
+st.title("📜 Evolução das Leis Federais – Câmara dos Deputados")
+
+col1, col2 = st.columns(2)
 with col1:
-    ano_ini = st.number_input("Ano inicial", 1988, 2025, 2019)
+    ano_ini = st.number_input("Ano inicial", min_value=1991, max_value=2025, value=2019, step=1)
 with col2:
-    ano_fim = st.number_input("Ano final", 1988, 2025, 2023)
-with col3:
-    tipo = st.selectbox("Tipo da proposição", ["PL", "PEC", "PLP", "PDL"])
+    ano_fim = st.number_input("Ano final", min_value=1991, max_value=2025, value=2025, step=1)
 
-st.divider()
-
-with st.spinner("Carregando dados da Câmara dos Deputados..."):
-    df = fetch_proposicoes(tipo, ano_ini, ano_fim)
-
-if df.empty:
-    st.error("Nenhuma proposição encontrada no período selecionado.")
+if ano_ini > ano_fim:
+    st.error("O ano inicial não pode ser maior que o ano final.")
     st.stop()
 
-st.success(f"Foram encontrados **{len(df):,} {tipo}s** no período selecionado.")
+st.caption("Fonte: API de Dados Abertos da Câmara dos Deputados")
+if st.button("Atualizar dados"):
+    with st.spinner("Buscando dados com paginação…"):
+        df = fetch_proposicoes(ano_ini, ano_fim, tipo="PL")
+    st.success(f"Total de proposições encontradas no período: {len(df)}")
 
+    st.subheader("Gráfico 1 – Evolução Mensal (Apresentação)")
+    grafico_evolucao(df)
 
-# ==========================================================
-# GRÁFICO 1 – EVOLUÇÃO TEMPORAL (mensal)
-# ==========================================================
-st.subheader("📈 Evolução Temporal")
-
-serie = df.groupby("mes").size().sort_index()
-
-fig1, ax1 = plt.subplots(figsize=(10, 4))
-ax1.plot(serie.index, serie.values, marker="o", linewidth=2.5, color="#48C9B0")
-ax1.fill_between(serie.index, serie.values, color="#48C9B0", alpha=0.3)
-
-ax1.set_title(f"Evolução mensal de {tipo}s ({ano_ini}–{ano_fim})")
-ax1.set_xlabel("Mês")
-ax1.set_ylabel("Quantidade")
-ax1.tick_params(axis="x", rotation=45)
-
-st.pyplot(fig1)
-st.caption("A série temporal usa a **data de apresentação** oficial registrada.")
-
-
-st.divider()
-
-# ==========================================================
-# GRÁFICO 2 – DISTRIBUIÇÃO POR PARTIDO
-# ==========================================================
-st.subheader("🏛️ Distribuição por Partido (Autoria)")
-
-# amostragem automática adaptada ao tamanho do dataset
-tamanho_amostra = min(600, len(df))
-
-ids = df["id"].dropna().sample(tamanho_amostra, random_state=42).tolist()
-
-with st.spinner(f"Coletando autores de {tamanho_amostra} proposições (amostra)..."):
-    dfp = buscar_partidos(ids)
-
-if dfp.empty:
-    st.warning("Não foi possível obter autores nesta amostra.")
-else:
-    contagem = dfp.groupby("partido").size().sort_values(ascending=False).head(20)
-
-    fig2, ax2 = plt.subplots(figsize=(10, 5))
-    ax2.bar(contagem.index, contagem.values, color="#5DADE2")
-    ax2.set_title(f"Top partidos que mais apresentaram {tipo}s (amostra)")
-    ax2.set_xlabel("Partido")
-    ax2.set_ylabel("Quantidade")
-    ax2.tick_params(axis="x", rotation=45)
-
-    st.pyplot(fig2)
-
-st.divider()
-
-with st.expander("📄 Ver tabela completa (primeiras 200 linhas)"):
-    st.dataframe(
-        df[["id", "ano", "numero", "siglaTipo", "dataApresentacao", "ementa"]].head(200),
-        use_container_width=True
-    )
+    st.subheader("Gráfico 2 – Distribuição por Partido (Autores)")
+    grafico_por_partido(df)
