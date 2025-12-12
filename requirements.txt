@@ -1,6 +1,7 @@
-streamlit
-pandas
-requests
-urllib3
-matplotlib
-plotly
+streamlit>=1.32
+pandas>=2.0
+requests>=2.31
+urllib3>=1.26
+plotly>=5.18
+matplotlib>=3.8
+numpy>=1.26
