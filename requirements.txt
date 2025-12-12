@@ -1,4 +1,6 @@
-streamlit>=1.36
-requests
+streamlit
 pandas
+requests
+urllib3
 matplotlib
+plotly
